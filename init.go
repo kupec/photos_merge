@@ -37,9 +37,8 @@ func main() {
 	filesChan := traverseFiles(dirPath)
 	hashMapChan := computeHashes(filesChan)
 
-	timer := time.NewTimer(time.Second)
-	ticks := 0
-	tickChars := []string{"-", `\`, "|", "/"}
+	timer := time.NewTimer(0)
+	progressPrinter := newProgressPrinter()
 	var hashMap map[string]string
 
 	for hashMap == nil {
@@ -49,21 +48,11 @@ func main() {
 		case <-timer.C:
 			timer.Reset(time.Second)
 
-			ticks++
-			tickChar := tickChars[ticks%len(tickChars)]
-
-			globalMu.Lock()
-			h, t := handledFiles, totalFiles
-			globalMu.Unlock()
-
-			progress := 100 * h / t
-			fmt.Printf("\r%s Progress: %d percent\thandled: %d\ttotal: %d", tickChar, progress, h, t)
+			progressPrinter.printProgress()
 		}
 	}
-
+	progressPrinter.printProgress()
 	fmt.Println("")
-	fmt.Println("")
-	fmt.Println("Result:")
 
 	jsonBytes, err := json.MarshalIndent(hashMap, "", "  ")
 	if err != nil {
@@ -84,6 +73,8 @@ func main() {
 		fmt.Fprintf(os.Stderr, "fail to write json file: %v\n", err)
 		os.Exit(1)
 	}
+
+	fmt.Println("Ready")
 }
 
 func traverseFiles(dirPath string) chan []string {
@@ -119,6 +110,14 @@ func traverseFiles(dirPath string) chan []string {
 		if err := walkDir(dirPath); err != nil {
 			fmt.Fprintf(os.Stderr, "fail walkDir: %v\n", err)
 			os.Exit(1)
+		}
+
+		if len(chunk) != 0 {
+			ch <- chunk
+
+			globalMu.Lock()
+			totalFiles += len(chunk)
+			globalMu.Unlock()
 		}
 
 		close(ch)
@@ -186,4 +185,31 @@ func fileHash(path string) (string, error) {
 		return "", fmt.Errorf("fail sha256: %w", err)
 	}
 	return hex.EncodeToString(h.Sum(nil)), nil
+}
+
+type progressPrinter struct {
+	ticks     int
+	tickChars []string
+}
+
+func newProgressPrinter() *progressPrinter {
+	return &progressPrinter{
+		tickChars: []string{"-", `\`, "|", "/"},
+	}
+}
+
+func (p *progressPrinter) printProgress() {
+	tickChar := p.tickChars[p.ticks%len(p.tickChars)]
+	p.ticks++
+
+	globalMu.Lock()
+	h, t := handledFiles, totalFiles
+	globalMu.Unlock()
+
+	progress := 0
+	if t > 0 {
+		progress = 100 * h / t
+	}
+
+	fmt.Printf("\r%s Progress: %3d%% \thandled: %d\ttotal: %d", tickChar, progress, h, t)
 }
