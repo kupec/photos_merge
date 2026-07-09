@@ -14,16 +14,16 @@ import (
 )
 
 const (
-	chunkSize   = 10
-	chanSize    = 100
+	chanSize    = 1000
 	workerCount = 2
+	partSize    = 100
 )
 
 var (
 	globalMu     sync.Mutex
 	handledFiles int
 	totalFiles   int
-	hashMap      map[string]string
+	fileHashes   []fileHash
 )
 
 func main() {
@@ -35,16 +35,17 @@ func main() {
 	dirPath := os.Args[1]
 
 	filesChan := traverseFiles(dirPath)
-	hashMapChan := computeHashes(filesChan)
+	fileHashesChan := computeHashes(filesChan)
+	doneChan := saveHashes(dirPath, fileHashesChan)
 
 	timer := time.NewTimer(0)
 	progressPrinter := newProgressPrinter()
-	var hashMap map[string]string
 
-	for hashMap == nil {
+	isDone := false
+	for !isDone {
 		select {
-		case hashMap = <-hashMapChan:
-			break
+		case <-doneChan:
+			isDone = true
 		case <-timer.C:
 			timer.Reset(time.Second)
 
@@ -53,35 +54,14 @@ func main() {
 	}
 	progressPrinter.printProgress()
 	fmt.Println("")
-
-	jsonBytes, err := json.MarshalIndent(hashMap, "", "  ")
-	if err != nil {
-		fmt.Fprintf(os.Stderr, "fail to marshal json: %v\n", err)
-		os.Exit(1)
-	}
-
-	file, err := os.Create(filepath.Join(dirPath, "index.json"))
-	if err != nil {
-		fmt.Fprintf(os.Stderr, "fail to create json file: %v\n", err)
-		os.Exit(1)
-	}
-	defer func() {
-		_ = file.Close()
-	}()
-
-	if _, err := file.Write(jsonBytes); err != nil {
-		fmt.Fprintf(os.Stderr, "fail to write json file: %v\n", err)
-		os.Exit(1)
-	}
-
 	fmt.Println("Ready")
 }
 
-func traverseFiles(dirPath string) chan []string {
-	ch := make(chan []string, chanSize)
+func traverseFiles(dirPath string) chan string {
+	ch := make(chan string, chanSize)
 
 	go func() {
-		chunk := make([]string, 0, chunkSize)
+		fileCounter := 0
 
 		walkDir := func(root string) error {
 			return filepath.WalkDir(root, func(path string, dir fs.DirEntry, err error) error {
@@ -92,15 +72,14 @@ func traverseFiles(dirPath string) chan []string {
 					return nil
 				}
 
-				chunk = append(chunk, path)
-				if len(chunk) == chunkSize {
-					ch <- chunk
+				ch <- path
 
+				fileCounter++
+				if fileCounter > 10 {
 					globalMu.Lock()
-					totalFiles += len(chunk)
+					totalFiles += fileCounter
+					fileCounter = 0
 					globalMu.Unlock()
-
-					chunk = make([]string, 0, chunkSize)
 				}
 
 				return nil
@@ -112,11 +91,9 @@ func traverseFiles(dirPath string) chan []string {
 			os.Exit(1)
 		}
 
-		if len(chunk) != 0 {
-			ch <- chunk
-
+		if fileCounter > 0 {
 			globalMu.Lock()
-			totalFiles += len(chunk)
+			totalFiles += fileCounter
 			globalMu.Unlock()
 		}
 
@@ -126,16 +103,16 @@ func traverseFiles(dirPath string) chan []string {
 	return ch
 }
 
-func computeHashes(ch chan []string) chan map[string]string {
-	resultChan := make(chan map[string]string)
+type fileHash struct {
+	Path string `json:"path"`
+	Hash string `json:"hash"`
+}
+
+func computeHashes(ch chan string) chan fileHash {
+	resultChan := make(chan fileHash)
 
 	go func() {
-		var (
-			mu sync.Mutex
-			wg sync.WaitGroup
-		)
-
-		result := make(map[string]string)
+		var wg sync.WaitGroup
 
 		for range workerCount {
 			wg.Add(1)
@@ -145,35 +122,29 @@ func computeHashes(ch chan []string) chan map[string]string {
 					wg.Done()
 				}()
 
-				for pathChunk := range ch {
-					for _, path := range pathChunk {
-						hash, err := fileHash(path)
-						if err != nil {
-							fmt.Fprintf(os.Stderr, "fail hash computating for %s: %v\n", path, err)
-							continue
-						}
-
-						mu.Lock()
-						result[hash] = path
-						mu.Unlock()
+				for path := range ch {
+					hash, err := hashFile(path)
+					if err != nil {
+						fmt.Fprintf(os.Stderr, "fail hash computating for %s: %v\n", path, err)
+						continue
 					}
 
-					globalMu.Lock()
-					handledFiles += len(pathChunk)
-					globalMu.Unlock()
+					resultChan <- fileHash{
+						Path: path,
+						Hash: hash,
+					}
 				}
 			}()
 		}
 
 		wg.Wait()
-		resultChan <- result
 		close(resultChan)
 	}()
 
 	return resultChan
 }
 
-func fileHash(path string) (string, error) {
+func hashFile(path string) (string, error) {
 	f, err := os.Open(path)
 	if err != nil {
 		return "", fmt.Errorf("fail open path=%s: %w", path, err)
@@ -185,6 +156,60 @@ func fileHash(path string) (string, error) {
 		return "", fmt.Errorf("fail sha256: %w", err)
 	}
 	return hex.EncodeToString(h.Sum(nil)), nil
+}
+
+func saveHashes(dirPath string, fileHashesChan chan fileHash) chan struct{} {
+	doneChan := make(chan struct{})
+
+	go func() {
+		savePart := func(partIndex int, part []fileHash) {
+			jsonBytes, err := json.MarshalIndent(part, "", "  ")
+			if err != nil {
+				fmt.Fprintf(os.Stderr, "fail to marshal json: %v\n", err)
+				os.Exit(1)
+			}
+
+			fileName := fmt.Sprintf("index.%d.json", partIndex)
+			file, err := os.Create(filepath.Join(dirPath, fileName))
+			if err != nil {
+				fmt.Fprintf(os.Stderr, "fail to create json file: %v\n", err)
+				os.Exit(1)
+			}
+			defer func() {
+				_ = file.Close()
+			}()
+
+			if _, err := file.Write(jsonBytes); err != nil {
+				fmt.Fprintf(os.Stderr, "fail to write json file: %v\n", err)
+				os.Exit(1)
+			}
+
+			globalMu.Lock()
+			handledFiles += len(part)
+			globalMu.Unlock()
+		}
+
+		partIndex := 0
+		part := make([]fileHash, 0, partSize)
+
+		for h := range fileHashesChan {
+			part = append(part, h)
+			if len(part) == cap(part) {
+				savePart(partIndex, part)
+				part = part[:0]
+				partIndex++
+			}
+		}
+
+		if len(part) > 0 {
+			savePart(partIndex, part)
+		}
+
+		doneChan <- struct{}{}
+		close(doneChan)
+	}()
+
+	return doneChan
 }
 
 type progressPrinter struct {
