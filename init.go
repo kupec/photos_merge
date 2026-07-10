@@ -9,6 +9,8 @@ import (
 	"io/fs"
 	"os"
 	"path/filepath"
+	"regexp"
+	"strconv"
 	"sync"
 	"time"
 )
@@ -20,23 +22,35 @@ const (
 )
 
 var (
-	globalMu     sync.Mutex
-	handledFiles int
-	totalFiles   int
-	fileHashes   []fileHash
+	globalMu       sync.Mutex
+	handledFiles   int
+	totalFiles     int
+	fileHashes     []fileHash
+	indexFileRegex = regexp.MustCompile(`index.(\d+).json`)
 )
+
+type PreviousRun struct {
+	fileHashMap   map[string]string
+	nextPartIndex int
+}
 
 func main() {
 	if len(os.Args) != 2 {
-		fmt.Printf("USAGE: %s <DIR>\n", os.Args[0])
+		fmt.Fprintf(os.Stderr, "USAGE: %s <DIR>\n", os.Args[0])
 		os.Exit(1)
 	}
 
 	dirPath := os.Args[1]
 
+	previousRun, err := loadPreviousRun(dirPath)
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "fail load previous run: %v\n", err)
+		os.Exit(1)
+	}
+
 	filesChan := traverseFiles(dirPath)
-	fileHashesChan := computeHashes(filesChan)
-	doneChan := saveHashes(dirPath, fileHashesChan)
+	fileHashesChan := computeHashes(filesChan, previousRun)
+	doneChan := saveHashes(dirPath, fileHashesChan, previousRun)
 
 	timer := time.NewTimer(0)
 	progressPrinter := newProgressPrinter()
@@ -55,6 +69,52 @@ func main() {
 	progressPrinter.printProgress()
 	fmt.Println("")
 	fmt.Println("Ready")
+}
+
+func loadPreviousRun(dirPath string) (*PreviousRun, error) {
+	entries, err := os.ReadDir(dirPath)
+	if err != nil {
+		return nil, fmt.Errorf("fail read dir %s: %w", dirPath, err)
+	}
+
+	nextPartIndex := 0
+	fileHashMap := make(map[string]string)
+
+	for _, entry := range entries {
+		matches := indexFileRegex.FindStringSubmatch(entry.Name())
+		if len(matches) == 0 {
+			continue
+		}
+
+		partIndex, err := strconv.Atoi(matches[1])
+		if err != nil {
+			continue
+		}
+
+		if partIndex >= nextPartIndex {
+			nextPartIndex = partIndex + 1
+		}
+
+		entryPath := filepath.Join(dirPath, entry.Name())
+		file, err := os.Open(entryPath)
+		if err != nil {
+			return nil, fmt.Errorf("fail open %s: %w", entryPath, err)
+		}
+
+		var hashes []fileHash
+		if err := json.NewDecoder(file).Decode(&hashes); err != nil {
+			return nil, fmt.Errorf("fail decode %s: %w", entryPath, err)
+		}
+
+		for _, hash := range hashes {
+			fileHashMap[hash.Path] = hash.Hash
+		}
+	}
+
+	return &PreviousRun{
+		fileHashMap:   fileHashMap,
+		nextPartIndex: nextPartIndex,
+	}, nil
 }
 
 func traverseFiles(dirPath string) chan string {
@@ -108,7 +168,7 @@ type fileHash struct {
 	Hash string `json:"hash"`
 }
 
-func computeHashes(ch chan string) chan fileHash {
+func computeHashes(ch chan string, previousRun *PreviousRun) chan fileHash {
 	resultChan := make(chan fileHash)
 
 	go func() {
@@ -123,6 +183,10 @@ func computeHashes(ch chan string) chan fileHash {
 				}()
 
 				for path := range ch {
+					if _, ok := previousRun.fileHashMap[path]; ok {
+						continue
+					}
+
 					hash, err := hashFile(path)
 					if err != nil {
 						fmt.Fprintf(os.Stderr, "fail hash computating for %s: %v\n", path, err)
@@ -158,29 +222,15 @@ func hashFile(path string) (string, error) {
 	return hex.EncodeToString(h.Sum(nil)), nil
 }
 
-func saveHashes(dirPath string, fileHashesChan chan fileHash) chan struct{} {
+func saveHashes(dirPath string, fileHashesChan chan fileHash, previousRun *PreviousRun) chan struct{} {
 	doneChan := make(chan struct{})
 
 	go func() {
 		savePart := func(partIndex int, part []fileHash) {
-			jsonBytes, err := json.MarshalIndent(part, "", "  ")
-			if err != nil {
-				fmt.Fprintf(os.Stderr, "fail to marshal json: %v\n", err)
-				os.Exit(1)
-			}
-
 			fileName := fmt.Sprintf("index.%d.json", partIndex)
-			file, err := os.Create(filepath.Join(dirPath, fileName))
+			err := saveHashesToFile(filepath.Join(dirPath, fileName), part)
 			if err != nil {
-				fmt.Fprintf(os.Stderr, "fail to create json file: %v\n", err)
-				os.Exit(1)
-			}
-			defer func() {
-				_ = file.Close()
-			}()
-
-			if _, err := file.Write(jsonBytes); err != nil {
-				fmt.Fprintf(os.Stderr, "fail to write json file: %v\n", err)
+				fmt.Fprintf(os.Stderr, "fail to save hashes part: %v\n", err)
 				os.Exit(1)
 			}
 
@@ -189,10 +239,14 @@ func saveHashes(dirPath string, fileHashesChan chan fileHash) chan struct{} {
 			globalMu.Unlock()
 		}
 
-		partIndex := 0
+		fileHashMap := previousRun.fileHashMap
+
+		partIndex := previousRun.nextPartIndex
 		part := make([]fileHash, 0, partSize)
 
 		for h := range fileHashesChan {
+			fileHashMap[h.Path] = h.Hash
+
 			part = append(part, h)
 			if len(part) == cap(part) {
 				savePart(partIndex, part)
@@ -205,11 +259,71 @@ func saveHashes(dirPath string, fileHashesChan chan fileHash) chan struct{} {
 			savePart(partIndex, part)
 		}
 
+		fileHashes := make([]fileHash, 0, len(fileHashMap))
+		for path, hash := range fileHashMap {
+			fileHashes = append(fileHashes, fileHash{
+				Path: path,
+				Hash: hash,
+			})
+		}
+
+		err := saveHashesToFile(filepath.Join(dirPath, "index.json"), fileHashes)
+		if err != nil {
+			fmt.Fprintf(os.Stderr, "fail to save final hashes: %v\n", err)
+			os.Exit(1)
+		}
+
+		if err := removePreviousRun(dirPath); err != nil {
+			fmt.Fprintf(os.Stderr, "fail to remove previous run: %v\n", err)
+			os.Exit(1)
+		}
+
 		doneChan <- struct{}{}
 		close(doneChan)
 	}()
 
 	return doneChan
+}
+
+func saveHashesToFile(filePath string, part []fileHash) error {
+	jsonBytes, err := json.MarshalIndent(part, "", "  ")
+	if err != nil {
+		return fmt.Errorf("fail to marshal json: %w\n", err)
+	}
+
+	file, err := os.Create(filePath)
+	if err != nil {
+		return fmt.Errorf("fail to create json file: %w\n", err)
+	}
+	defer func() {
+		_ = file.Close()
+	}()
+
+	if _, err := file.Write(jsonBytes); err != nil {
+		return fmt.Errorf("fail to write json file: %w\n", err)
+	}
+
+	return nil
+}
+
+func removePreviousRun(dirPath string) error {
+	entries, err := os.ReadDir(dirPath)
+	if err != nil {
+		return fmt.Errorf("fail read dir %s: %w", dirPath, err)
+	}
+
+	for _, entry := range entries {
+		if !indexFileRegex.MatchString(entry.Name()) {
+			continue
+		}
+
+		entryPath := filepath.Join(dirPath, entry.Name())
+		if err := os.Remove(entryPath); err != nil {
+			return fmt.Errorf("fail remove %s: %w", entryPath, err)
+		}
+	}
+
+	return nil
 }
 
 type progressPrinter struct {
