@@ -7,6 +7,7 @@ import (
 	"fmt"
 	"io"
 	"io/fs"
+	"maps"
 	"os"
 	"path/filepath"
 	"regexp"
@@ -17,7 +18,7 @@ import (
 
 const (
 	chanSize    = 1000
-	workerCount = 2
+	workerCount = 4
 	partSize    = 100
 )
 
@@ -48,8 +49,11 @@ func main() {
 		os.Exit(1)
 	}
 
-	filesChan := traverseFiles(dirPath)
-	fileHashesChan := computeHashes(filesChan, previousRun)
+	handledFiles = len(previousRun.fileHashMap)
+	totalFiles = handledFiles
+
+	filesChan := traverseFiles(dirPath, previousRun)
+	fileHashesChan := computeHashes(filesChan)
 	doneChan := saveHashes(dirPath, fileHashesChan, previousRun)
 
 	timer := time.NewTimer(0)
@@ -117,7 +121,7 @@ func loadPreviousRun(dirPath string) (*PreviousRun, error) {
 	}, nil
 }
 
-func traverseFiles(dirPath string) chan string {
+func traverseFiles(dirPath string, previousRun *PreviousRun) chan string {
 	ch := make(chan string, chanSize)
 
 	go func() {
@@ -129,6 +133,10 @@ func traverseFiles(dirPath string) chan string {
 					return err
 				}
 				if dir.IsDir() {
+					return nil
+				}
+
+				if _, ok := previousRun.fileHashMap[path]; ok {
 					return nil
 				}
 
@@ -168,8 +176,8 @@ type fileHash struct {
 	Hash string `json:"hash"`
 }
 
-func computeHashes(ch chan string, previousRun *PreviousRun) chan fileHash {
-	resultChan := make(chan fileHash)
+func computeHashes(ch chan string) chan fileHash {
+	resultChan := make(chan fileHash, chanSize)
 
 	go func() {
 		var wg sync.WaitGroup
@@ -178,15 +186,9 @@ func computeHashes(ch chan string, previousRun *PreviousRun) chan fileHash {
 			wg.Add(1)
 
 			go func() {
-				defer func() {
-					wg.Done()
-				}()
+				defer wg.Done()
 
 				for path := range ch {
-					if _, ok := previousRun.fileHashMap[path]; ok {
-						continue
-					}
-
 					hash, err := hashFile(path)
 					if err != nil {
 						fmt.Fprintf(os.Stderr, "fail hash computating for %s: %v\n", path, err)
@@ -239,7 +241,7 @@ func saveHashes(dirPath string, fileHashesChan chan fileHash, previousRun *Previ
 			globalMu.Unlock()
 		}
 
-		fileHashMap := previousRun.fileHashMap
+		fileHashMap := maps.Clone(previousRun.fileHashMap)
 
 		partIndex := previousRun.nextPartIndex
 		part := make([]fileHash, 0, partSize)
@@ -295,9 +297,7 @@ func saveHashesToFile(filePath string, part []fileHash) error {
 	if err != nil {
 		return fmt.Errorf("fail to create json file: %w\n", err)
 	}
-	defer func() {
-		_ = file.Close()
-	}()
+	defer file.Close()
 
 	if _, err := file.Write(jsonBytes); err != nil {
 		return fmt.Errorf("fail to write json file: %w\n", err)
