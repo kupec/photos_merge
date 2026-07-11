@@ -1,6 +1,7 @@
 package main
 
 import (
+	"context"
 	"crypto/sha256"
 	"encoding/hex"
 	"encoding/json"
@@ -14,6 +15,12 @@ import (
 	"strconv"
 	"sync"
 	"time"
+
+	"go.opentelemetry.io/otel/exporters/otlp/otlptrace/otlptracehttp"
+	"go.opentelemetry.io/otel/sdk/resource"
+	sdktrace "go.opentelemetry.io/otel/sdk/trace"
+	semconv "go.opentelemetry.io/otel/semconv/v1.24.0"
+	"go.opentelemetry.io/otel/trace"
 )
 
 const (
@@ -28,6 +35,7 @@ var (
 	totalFiles     int
 	fileHashes     []fileHash
 	indexFileRegex = regexp.MustCompile(`index.(\d+).json`)
+	tr             trace.Tracer
 )
 
 type PreviousRun struct {
@@ -43,18 +51,32 @@ func main() {
 
 	dirPath := os.Args[1]
 
+	tp := newTraceProvider()
+	defer tp.Shutdown(context.Background())
+
+	tr = tp.Tracer("init tool")
+
+	ctx, span := tr.Start(context.Background(), "main")
+	defer span.End()
+
+	_, spanLoadPreviousRun := tr.Start(ctx, "loadPreviousRun")
+
 	previousRun, err := loadPreviousRun(dirPath)
 	if err != nil {
 		fmt.Fprintf(os.Stderr, "fail load previous run: %v\n", err)
 		os.Exit(1)
 	}
 
+	spanLoadPreviousRun.End()
+	_, spanRestMain := tr.Start(ctx, "rest-main")
+	defer spanRestMain.End()
+
 	handledFiles = len(previousRun.fileHashMap)
 	totalFiles = handledFiles
 
-	filesChan := traverseFiles(dirPath, previousRun)
-	fileHashesChan := computeHashes(filesChan)
-	doneChan := saveHashes(dirPath, fileHashesChan, previousRun)
+	filesChan := traverseFiles(ctx, dirPath, previousRun)
+	fileHashesChan := computeHashes(ctx, filesChan)
+	doneChan := saveHashes(ctx, dirPath, fileHashesChan, previousRun)
 
 	timer := time.NewTimer(0)
 	progressPrinter := newProgressPrinter()
@@ -73,6 +95,31 @@ func main() {
 	progressPrinter.printProgress()
 	fmt.Println("")
 	fmt.Println("Ready")
+}
+
+func newTraceProvider() *sdktrace.TracerProvider {
+	endpoint := "192.168.122.78:4318"
+	exporter, err := otlptracehttp.New(
+		context.Background(),
+		otlptracehttp.WithEndpoint(endpoint),
+		otlptracehttp.WithInsecure(),
+	)
+	if err != nil {
+		panic(err)
+	}
+
+	rsc, err := resource.New(context.Background(), resource.WithAttributes(
+		semconv.ServiceNameKey.String("init tool"),
+		semconv.TelemetrySDKLanguageKey.String("go"),
+	))
+	if err != nil {
+		panic(err)
+	}
+
+	return sdktrace.NewTracerProvider(
+		sdktrace.WithBatcher(exporter),
+		sdktrace.WithResource(rsc),
+	)
 }
 
 func loadPreviousRun(dirPath string) (*PreviousRun, error) {
@@ -121,10 +168,13 @@ func loadPreviousRun(dirPath string) (*PreviousRun, error) {
 	}, nil
 }
 
-func traverseFiles(dirPath string, previousRun *PreviousRun) chan string {
+func traverseFiles(ctx context.Context, dirPath string, previousRun *PreviousRun) chan string {
 	ch := make(chan string, chanSize)
 
 	go func() {
+		ctx, span := tr.Start(ctx, "traverseFiles")
+		defer span.End()
+
 		fileCounter := 0
 
 		walkDir := func(root string) error {
@@ -140,7 +190,11 @@ func traverseFiles(dirPath string, previousRun *PreviousRun) chan string {
 					return nil
 				}
 
+				_, chSpan := tr.Start(ctx, "traverseFiles: wait for channel to write")
+
 				ch <- path
+
+				chSpan.End()
 
 				fileCounter++
 				if fileCounter > 10 {
@@ -176,7 +230,7 @@ type fileHash struct {
 	Hash string `json:"hash"`
 }
 
-func computeHashes(ch chan string) chan fileHash {
+func computeHashes(ctx context.Context, ch chan string) chan fileHash {
 	resultChan := make(chan fileHash, chanSize)
 
 	go func() {
@@ -188,18 +242,34 @@ func computeHashes(ch chan string) chan fileHash {
 			go func() {
 				defer wg.Done()
 
+				ctx, span := tr.Start(ctx, "computeHashes:worker")
+				defer span.End()
+
+				_, span = tr.Start(ctx, "computeHashes: wait for reading channel")
+
 				for path := range ch {
+					span.End()
+					_, span = tr.Start(ctx, "hashFile")
+
 					hash, err := hashFile(path)
 					if err != nil {
 						fmt.Fprintf(os.Stderr, "fail hash computating for %s: %v\n", path, err)
 						continue
 					}
 
+					span.End()
+					_, span = tr.Start(ctx, "computeHashes: wait for writing to channel")
+
 					resultChan <- fileHash{
 						Path: path,
 						Hash: hash,
 					}
+
+					span.End()
+					_, span = tr.Start(ctx, "computeHashes: wait for reading channel")
 				}
+
+				span.End()
 			}()
 		}
 
@@ -224,10 +294,13 @@ func hashFile(path string) (string, error) {
 	return hex.EncodeToString(h.Sum(nil)), nil
 }
 
-func saveHashes(dirPath string, fileHashesChan chan fileHash, previousRun *PreviousRun) chan struct{} {
+func saveHashes(ctx context.Context, dirPath string, fileHashesChan chan fileHash, previousRun *PreviousRun) chan struct{} {
 	doneChan := make(chan struct{})
 
 	go func() {
+		ctx, span := tr.Start(ctx, "saveHashes")
+		defer span.End()
+
 		savePart := func(partIndex int, part []fileHash) {
 			fileName := fmt.Sprintf("index.%d.json", partIndex)
 			err := saveHashesToFile(filepath.Join(dirPath, fileName), part)
@@ -246,19 +319,35 @@ func saveHashes(dirPath string, fileHashesChan chan fileHash, previousRun *Previ
 		partIndex := previousRun.nextPartIndex
 		part := make([]fileHash, 0, partSize)
 
+		_, span = tr.Start(ctx, "saveHashes: wait for reading channel")
+
 		for h := range fileHashesChan {
+			span.End()
+
 			fileHashMap[h.Path] = h.Hash
 
 			part = append(part, h)
 			if len(part) == cap(part) {
+				_, span = tr.Start(ctx, "savePart")
+
 				savePart(partIndex, part)
 				part = part[:0]
 				partIndex++
+
+				span.End()
 			}
+
+			_, span = tr.Start(ctx, "saveHashes: wait for reading channel")
 		}
 
+		span.End()
+
 		if len(part) > 0 {
+			_, span = tr.Start(ctx, "savePart")
+
 			savePart(partIndex, part)
+
+			span.End()
 		}
 
 		fileHashes := make([]fileHash, 0, len(fileHashMap))
@@ -269,16 +358,23 @@ func saveHashes(dirPath string, fileHashesChan chan fileHash, previousRun *Previ
 			})
 		}
 
+		_, span = tr.Start(ctx, "saveHashesToFile")
+
 		err := saveHashesToFile(filepath.Join(dirPath, "index.json"), fileHashes)
 		if err != nil {
 			fmt.Fprintf(os.Stderr, "fail to save final hashes: %v\n", err)
 			os.Exit(1)
 		}
 
+		span.End()
+		_, span = tr.Start(ctx, "removePreviousRun")
+
 		if err := removePreviousRun(dirPath); err != nil {
 			fmt.Fprintf(os.Stderr, "fail to remove previous run: %v\n", err)
 			os.Exit(1)
 		}
+
+		span.End()
 
 		doneChan <- struct{}{}
 		close(doneChan)
