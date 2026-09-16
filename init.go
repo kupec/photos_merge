@@ -51,6 +51,13 @@ func main() {
 
 	dirPath := os.Args[1]
 
+	absDirPath, err := filepath.Abs(dirPath)
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "fail to get absolute path: %v\n", err)
+		os.Exit(1)
+	}
+	dirPath = absDirPath
+
 	tp := newTraceProvider()
 	defer tp.Shutdown(context.Background())
 
@@ -87,7 +94,7 @@ func main() {
 		case <-doneChan:
 			isDone = true
 		case <-timer.C:
-			timer.Reset(time.Second)
+			timer.Reset(100 * time.Millisecond)
 
 			progressPrinter.printProgress()
 		}
@@ -98,6 +105,10 @@ func main() {
 }
 
 func newTraceProvider() *sdktrace.TracerProvider {
+	if os.Getenv("DEBUG") != "1" {
+		return sdktrace.NewTracerProvider()
+	}
+
 	endpoint := "192.168.122.78:4318"
 	exporter, err := otlptracehttp.New(
 		context.Background(),
@@ -178,15 +189,24 @@ func traverseFiles(ctx context.Context, dirPath string, previousRun *PreviousRun
 		fileCounter := 0
 
 		walkDir := func(root string) error {
-			return filepath.WalkDir(root, func(path string, dir fs.DirEntry, err error) error {
+			return filepath.WalkDir(root, func(path string, entry fs.DirEntry, err error) error {
 				if err != nil {
 					return err
 				}
-				if dir.IsDir() {
+				if entry.IsDir() {
 					return nil
 				}
 
-				if _, ok := previousRun.fileHashMap[path]; ok {
+				if indexFileRegex.MatchString(entry.Name()) || entry.Name() == "index.json" {
+					return nil
+				}
+
+				relPath, err := filepath.Rel(dirPath, path)
+				if err != nil {
+					return fmt.Errorf("fail to get relative path for %s: %w", path, err)
+				}
+
+				if _, ok := previousRun.fileHashMap[relPath]; ok {
 					return nil
 				}
 
@@ -324,9 +344,17 @@ func saveHashes(ctx context.Context, dirPath string, fileHashesChan chan fileHas
 		for h := range fileHashesChan {
 			span.End()
 
-			fileHashMap[h.Path] = h.Hash
+			relPath, err := filepath.Rel(dirPath, h.Path)
+			if err != nil {
+				relPath = h.Path
+			}
 
-			part = append(part, h)
+			fileHashMap[relPath] = h.Hash
+
+			part = append(part, fileHash{
+				Path: relPath,
+				Hash: h.Hash,
+			})
 			if len(part) == cap(part) {
 				_, span = tr.Start(ctx, "savePart")
 
@@ -429,7 +457,7 @@ type progressPrinter struct {
 
 func newProgressPrinter() *progressPrinter {
 	return &progressPrinter{
-		tickChars: []string{"-", `\`, "|", "/"},
+		tickChars: []string{"⣾", "⣽", "⣻", "⢿", "⡿", "⣟", "⣯", "⣷"},
 	}
 }
 
